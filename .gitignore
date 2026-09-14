@@ -1,3 +1,19 @@
+# Ejecutables y binarios
 *.o
+*.out
 *.exe
 planificador
+
+# Archivos de depuración
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Archivos temporales del editor / sistema
+*~
+.vscode/
+.DS_Store
+
+# Archivos de log (si tu programa genera logs al correr las pruebas de estrés)
+*.log
