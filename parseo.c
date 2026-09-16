@@ -1,1 +1,0 @@
-// Vale mensa malvada
