@@ -1,0 +1,10 @@
+1 : prender_carbon : 500 :
+2 : comprar_carne : 800 :
+3 : comprar_pan : 300 :
+4 : comprar_bebidas :  :
+5 : asar_longaniza : 700 : 1, 2
+6 : armar_choripan : 300 : 3, 5
+7 : preparar_pebre : 400 :
+8 : poner_mesa :  : 4
+9 : servir_choripan : 200 : 6, 7
+10 : brindis :  : 8, 9
