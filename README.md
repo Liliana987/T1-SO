@@ -43,6 +43,17 @@ Ejemplo:
 Si el campo `tiempo_ms` viene vacío, se asigna un valor aleatorio entre 100 y
 5000 ms.
 
+### Variable de entorno opcional: `PROB_FALLO`
+
+Para probar el aislamiento de errores, se puede simular que cada actividad
+falle con cierta probabilidad (0-100):
+
+```bash
+PROB_FALLO=30 ./planificador plan.txt 4
+```
+
+Sin definir `PROB_FALLO`, esta rama de código nunca se activa y el
+comportamiento es el normal.
 
 ### Interrumpir la ejecución (Ctrl+C)
 
