@@ -20,6 +20,7 @@ static void dormir_ms(long ms) {
 #define MAX_LINEA   1024
 #define MAX_MENSAJE 256
 #define MAX_ACTIVIDADES 10000
+#define CAP_INICIAL 64
 
 typedef enum { PENDIENTE, CORRIENDO, DONE, FALLIDA } Estado;
 
@@ -28,7 +29,11 @@ typedef struct {
     char nombre[64];
     long tiempo_ms;
     int num_deps;
-    char (*deps)[32];      /* arreglo dinamico de ids de dependencias */
+    char (*deps)[32];      /* ids de dependencias, tal como vienen del archivo */
+    int *deps_idx;          /* indices ya resueltos de cada dependencia (-1 = no existe) */
+    int pendientes;         /* dependencias validas aun no terminadas (algoritmo de Kahn) */
+    int *dependientes;      /* indices de actividades que dependen de esta */
+    int num_dependientes;
     pid_t pid;
     Estado estado;
     int pipe_fd[2];
@@ -36,15 +41,18 @@ typedef struct {
 } Actividad;
 
 /* ---------- Globales para el manejo de SIGINT ---------- */
+/* g_idx_activos[i] guarda el indice en acts[] de la actividad cuyo pid
+ * esta en g_pids_activos[i], en la misma posicion. Sirve para, al volver
+ * de waitpid, encontrar la actividad sin recorrer las n actividades: solo
+ * se recorre el bloque de procesos activos (tamano <= K). */
 static pid_t g_pids_activos[MAX_ACTIVIDADES];
+static int   g_idx_activos[MAX_ACTIVIDADES];
 static int g_num_pids_activos = 0;
 
 /* ---------- Prototipos ---------- */
 static char *trim(char *s);
-static int buscar_indice(Actividad *acts, int n, const char *id);
 int parsear_plan(const char *ruta, Actividad **out, int *out_n);
-int dependencias_cumplidas(Actividad *acts, int n, int idx);
-int todas_terminadas(Actividad *acts, int n);
+int resolver_dependencias(Actividad *acts, int n);
 void manejador_sigint(int sig);
 int ejecutar_plan(Actividad *acts, int n, int K, int prob_fallo);
 void liberar_actividades(Actividad *acts, int n);
@@ -59,13 +67,6 @@ static char *trim(char *s) {
     return s;
 }
 
-static int buscar_indice(Actividad *acts, int n, const char *id) {
-    for (int i = 0; i < n; i++) {
-        if (strcmp(acts[i].id, id) == 0) return i;
-    }
-    return -1;
-}
-
 /* ---------- parseo de plan.txt ---------- */
 int parsear_plan(const char *ruta, Actividad **out, int *out_n) {
     FILE *f = fopen(ruta, "r");
@@ -76,6 +77,7 @@ int parsear_plan(const char *ruta, Actividad **out, int *out_n) {
 
     Actividad *acts = NULL;
     int n = 0;
+    int cap = 0;
     char linea[MAX_LINEA];
 
     srand((unsigned int) time(NULL));
@@ -94,14 +96,22 @@ int parsear_plan(const char *ruta, Actividad **out, int *out_n) {
             continue;
         }
 
-        Actividad *tmp = realloc(acts, (size_t)(n + 1) * sizeof(Actividad));
-        if (!tmp) {
-            perror("realloc");
-            free(acts);
-            fclose(f);
-            return -1;
+        /* Capacidad duplicada (64, 128, 256, ...) en vez de +1 por linea:
+         * asi el costo de hacer crecer el arreglo se amortiza a O(1) por
+         * actividad en vez de O(n) por actividad, lo que importa mucho
+         * con planes de hasta 10000 lineas (criterio 2.4). */
+        if (n == cap) {
+            int nueva_cap = (cap == 0) ? CAP_INICIAL : cap * 2;
+            Actividad *tmp = realloc(acts, (size_t) nueva_cap * sizeof(Actividad));
+            if (!tmp) {
+                perror("realloc");
+                free(acts);
+                fclose(f);
+                return -1;
+            }
+            acts = tmp;
+            cap = nueva_cap;
         }
-        acts = tmp;
 
         Actividad *a = &acts[n];
         memset(a, 0, sizeof(*a));
@@ -130,6 +140,7 @@ int parsear_plan(const char *ruta, Actividad **out, int *out_n) {
                 char *copia = malloc(len2);
                 if (!copia) {
                     perror("malloc");
+                    free(acts);
                     fclose(f);
                     return -1;
                 }
@@ -143,6 +154,7 @@ int parsear_plan(const char *ruta, Actividad **out, int *out_n) {
                         if (!nuevo) {
                             perror("realloc deps");
                             free(copia);
+                            free(acts);
                             fclose(f);
                             return -1;
                         }
@@ -157,6 +169,10 @@ int parsear_plan(const char *ruta, Actividad **out, int *out_n) {
             }
         }
 
+        a->deps_idx = NULL;
+        a->pendientes = 0;
+        a->dependientes = NULL;
+        a->num_dependientes = 0;
         a->pid = -1;
         a->estado = PENDIENTE;
         a->mensaje[0] = '\0';
@@ -165,29 +181,103 @@ int parsear_plan(const char *ruta, Actividad **out, int *out_n) {
     }
 
     fclose(f);
+
+    /* Ajustar al tamano exacto: libera la memoria de mas que dejo el
+     * crecimiento por duplicacion. Si el shrink fallara (no deberia),
+     * seguimos con el bloque anterior, que sigue siendo valido. */
+    if (n > 0 && n < cap) {
+        Actividad *ajustado = realloc(acts, (size_t) n * sizeof(Actividad));
+        if (ajustado) acts = ajustado;
+    }
+
     *out = acts;
     *out_n = n;
     return 0;
 }
 
-/* ---------- DAG ---------- */
-/* devuelve: 0 = aun no listo, 1 = listo para correr, 2 = fallida (una dependencia fallo) */
-int dependencias_cumplidas(Actividad *acts, int n, int idx) {
-    Actividad *a = &acts[idx];
-    for (int i = 0; i < a->num_deps; i++) {
-        int j = buscar_indice(acts, n, a->deps[i]);
-        if (j < 0) continue; /* dependencia inexistente: se ignora */
-        if (acts[j].estado == FALLIDA) return 2;
-        if (acts[j].estado != DONE) return 0;
-    }
-    return 1;
+/* ---------- resolucion de dependencias: de strings a indices ---------- */
+typedef struct { const char *id; int idx; } IdIdx;
+
+static int cmp_ididx(const void *a, const void *b) {
+    const IdIdx *pa = a;
+    const IdIdx *pb = b;
+    return strcmp(pa->id, pb->id);
 }
 
-int todas_terminadas(Actividad *acts, int n) {
+static int cmp_id_clave(const void *clave, const void *elem) {
+    const char *k = clave;
+    const IdIdx *e = elem;
+    return strcmp(k, e->id);
+}
+
+/* Convierte, una sola vez, las dependencias (guardadas como texto) en
+ * indices dentro de acts[], y arma para cada actividad la lista inversa
+ * de "quien depende de mi" (dependientes). Con esto el planificador deja
+ * de necesitar busqueda lineal por id en tiempo de ejecucion: usa un
+ * arreglo ordenado + busqueda binaria (O(log n)) una sola vez aqui, y
+ * despues todo el recorrido del DAG es O(n + cantidad de dependencias). */
+int resolver_dependencias(Actividad *acts, int n) {
+    if (n == 0) return 0;
+
+    IdIdx *tabla = malloc((size_t) n * sizeof(IdIdx));
+    if (!tabla) { perror("malloc tabla ids"); return -1; }
     for (int i = 0; i < n; i++) {
-        if (acts[i].estado == PENDIENTE || acts[i].estado == CORRIENDO) return 0;
+        tabla[i].id = acts[i].id;
+        tabla[i].idx = i;
     }
-    return 1;
+    qsort(tabla, (size_t) n, sizeof(IdIdx), cmp_ididx);
+
+    int *out_count = calloc((size_t) n, sizeof(int));
+    if (!out_count) { perror("calloc"); free(tabla); return -1; }
+
+    /* Pasada 1: resolver cada dependencia a un indice y contar cuantos
+     * "dependientes" tendra cada actividad objetivo. */
+    for (int i = 0; i < n; i++) {
+        Actividad *a = &acts[i];
+        a->pendientes = 0;
+        if (a->num_deps == 0) continue;
+
+        a->deps_idx = malloc((size_t) a->num_deps * sizeof(int));
+        if (!a->deps_idx) { perror("malloc deps_idx"); free(tabla); free(out_count); return -1; }
+
+        for (int d = 0; d < a->num_deps; d++) {
+            IdIdx *hallado = bsearch(a->deps[d], tabla, (size_t) n, sizeof(IdIdx), cmp_id_clave);
+            int j = hallado ? hallado->idx : -1;
+            a->deps_idx[d] = j;
+            if (j >= 0) {
+                a->pendientes++;
+                out_count[j]++;
+            }
+            /* j < 0: dependencia inexistente, se ignora (mismo criterio
+             * que la version anterior). */
+        }
+    }
+    free(tabla);
+
+    /* Pasada 2: reservar el arreglo de dependientes con el tamano exacto
+     * (ya lo sabemos por out_count) y llenarlo. Sin esto, tendriamos que
+     * hacer realloc de a uno, otra vez O(n^2) en el peor caso. */
+    for (int i = 0; i < n; i++) {
+        if (out_count[i] > 0) {
+            acts[i].dependientes = malloc((size_t) out_count[i] * sizeof(int));
+            if (!acts[i].dependientes) { perror("malloc dependientes"); free(out_count); return -1; }
+        } else {
+            acts[i].dependientes = NULL;
+        }
+        acts[i].num_dependientes = 0; /* aqui se usa como cursor de llenado */
+    }
+    for (int i = 0; i < n; i++) {
+        Actividad *a = &acts[i];
+        for (int d = 0; d < a->num_deps; d++) {
+            int j = a->deps_idx[d];
+            if (j >= 0) {
+                acts[j].dependientes[acts[j].num_dependientes++] = i;
+            }
+        }
+    }
+
+    free(out_count);
+    return 0;
 }
 
 /* ---------- SIGINT: la "inspeccion de la Seremi" ---------- */
@@ -201,32 +291,66 @@ void manejador_sigint(int sig) {
     _exit(130); /* 128 + SIGINT, convencion habitual */
 }
 
+/* Propaga FALLIDA en cascada a todos los dependientes (directos e
+ * indirectos) de una actividad que fallo. Iterativo con una pila propia
+ * (en vez de recursion) para no arriesgar un desborde de stack si el DAG
+ * tiene una cadena muy larga (hasta 10000 actividades en fila es un caso
+ * valido segun el enunciado). */
+static void propagar_fallo(Actividad *acts, int idx, int *pila, int *restantes) {
+    int tope = 0;
+    pila[tope++] = idx;
+    while (tope > 0) {
+        int actual = pila[--tope];
+        for (int k = 0; k < acts[actual].num_dependientes; k++) {
+            int dep = acts[actual].dependientes[k];
+            if (acts[dep].estado == PENDIENTE) {
+                acts[dep].estado = FALLIDA;
+                printf("[FALLO] %s no se ejecuta: dependencia fallida\n", acts[dep].id);
+                (*restantes)--;
+                pila[tope++] = dep;
+            }
+        }
+    }
+}
+
 /* ---------- planificador principal ---------- */
 int ejecutar_plan(Actividad *acts, int n, int K, int prob_fallo) {
+    /* cola: actividades listas para correr (pendientes == 0), en orden de
+     * llegada. Cada actividad entra aqui a lo mas una vez en toda la
+     * ejecucion, asi que un arreglo de tamano n alcanza siempre. */
+    int *cola = malloc((size_t) n * sizeof(int));
+    int *pila_fallo = malloc((size_t) n * sizeof(int));
+    if (!cola || !pila_fallo) {
+        perror("malloc planificador");
+        free(cola);
+        free(pila_fallo);
+        return -1;
+    }
+    int frente = 0, fondo = 0;
     int activos = 0;
+    int restantes = n; /* actividades que aun no llegan a DONE ni FALLIDA */
 
-    while (!todas_terminadas(acts, n)) {
+    for (int i = 0; i < n; i++) {
+        if (acts[i].pendientes == 0) cola[fondo++] = i;
+    }
+
+    while (restantes > 0) {
 
         /* 1. lanzar actividades listas mientras haya cupo (K) */
-        for (int i = 0; i < n && activos < K; i++) {
-            if (acts[i].estado != PENDIENTE) continue;
-
-            int listo = dependencias_cumplidas(acts, n, i);
-            if (listo == 2) {
-                acts[i].estado = FALLIDA;
-                printf("[FALLO] %s no se ejecuta: dependencia fallida\n", acts[i].id);
-                continue;
-            }
-            if (listo != 1) continue;
+        while (activos < K && frente < fondo) {
+            int i = cola[frente++];
+            if (acts[i].estado != PENDIENTE) continue; /* resguardo defensivo */
 
             if (pipe(acts[i].pipe_fd) == -1) {
                 perror("pipe");
+                free(cola); free(pila_fallo);
                 return -1;
             }
 
             pid_t pid = fork();
             if (pid < 0) {
                 perror("fork");
+                free(cola); free(pila_fallo);
                 return -1;
             }
 
@@ -237,14 +361,13 @@ int ejecutar_plan(Actividad *acts, int n, int K, int prob_fallo) {
                 /* Propagacion de insumo: como este fork ocurre solo despues
                  * de que todas las dependencias de acts[i] terminaron, el
                  * hijo hereda (via fork) el arreglo acts[] ya con los
-                 * mensajes de esas dependencias escritos por el padre. Aqui
-                 * los leemos y los mostramos como "insumo recibido" antes
-                 * de empezar a trabajar: esa es la propagacion del mensaje
-                 * hacia la actividad dependiente que pide el enunciado. */
+                 * mensajes de esas dependencias escritos por el padre.
+                 * deps_idx ya viene resuelto (resolver_dependencias), asi
+                 * que aqui no hace falta ninguna busqueda: acceso directo. */
                 char insumos[MAX_MENSAJE];
                 insumos[0] = '\0';
                 for (int d = 0; d < acts[i].num_deps; d++) {
-                    int j = buscar_indice(acts, n, acts[i].deps[d]);
+                    int j = acts[i].deps_idx[d];
                     if (j >= 0 && acts[j].mensaje[0] != '\0') {
                         size_t len = strlen(insumos);
                         snprintf(insumos + len, sizeof(insumos) - len,
@@ -262,11 +385,7 @@ int ejecutar_plan(Actividad *acts, int n, int K, int prob_fallo) {
 
                 /* Simulacion opcional de fallo interno, activada solo si se
                  * define la variable de entorno PROB_FALLO (0-100). Sin
-                 * ella, prob_fallo llega en 0 y esta rama nunca se toma:
-                 * el comportamiento por defecto no cambia. Se usa para
-                 * poder demostrar el aislamiento de errores (criterio 2.3)
-                 * sin alterar la invocacion obligatoria ./planificador
-                 * plan.txt K ni el formato de plan.txt. */
+                 * ella, prob_fallo llega en 0 y esta rama nunca se toma. */
                 if (prob_fallo > 0) {
                     unsigned semilla = (unsigned) getpid() ^ (unsigned) time(NULL);
                     srand(semilla);
@@ -293,7 +412,9 @@ int ejecutar_plan(Actividad *acts, int n, int K, int prob_fallo) {
             close(acts[i].pipe_fd[1]);
             acts[i].pid = pid;
             acts[i].estado = CORRIENDO;
-            g_pids_activos[g_num_pids_activos++] = pid;
+            g_pids_activos[g_num_pids_activos] = pid;
+            g_idx_activos[g_num_pids_activos] = i;
+            g_num_pids_activos++;
             activos++;
         }
 
@@ -303,12 +424,20 @@ int ejecutar_plan(Actividad *acts, int n, int K, int prob_fallo) {
             pid_t hijo = waitpid(-1, &status, 0);
             if (hijo < 0) {
                 perror("waitpid");
+                free(cola); free(pila_fallo);
                 return -1;
             }
 
-            int idx = -1;
-            for (int i = 0; i < n; i++) {
-                if (acts[i].pid == hijo) { idx = i; break; }
+            /* Encontrar el indice del hijo recorriendo solo los procesos
+             * activos (a lo mas K), no las n actividades. */
+            int idx = -1, pos = -1;
+            for (int p = 0; p < g_num_pids_activos; p++) {
+                if (g_pids_activos[p] == hijo) { pos = p; idx = g_idx_activos[p]; break; }
+            }
+            if (pos >= 0) {
+                g_pids_activos[pos] = g_pids_activos[g_num_pids_activos - 1];
+                g_idx_activos[pos]  = g_idx_activos[g_num_pids_activos - 1];
+                g_num_pids_activos--;
             }
 
             if (idx >= 0) {
@@ -319,28 +448,45 @@ int ejecutar_plan(Actividad *acts, int n, int K, int prob_fallo) {
 
                 if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
                     acts[idx].estado = DONE;
+                    restantes--;
                     printf("[OK] %s\n", acts[idx].mensaje);
+
+                    /* Avisar solo a los dependientes directos: bajarles el
+                     * contador de pendientes, y si alguno llega a 0, ya
+                     * puede entrar a la cola de listos. */
+                    for (int k = 0; k < acts[idx].num_dependientes; k++) {
+                        int dep = acts[idx].dependientes[k];
+                        if (acts[dep].estado == PENDIENTE) {
+                            acts[dep].pendientes--;
+                            if (acts[dep].pendientes == 0) {
+                                cola[fondo++] = dep;
+                            }
+                        }
+                    }
                 } else {
                     acts[idx].estado = FALLIDA;
+                    restantes--;
                     printf("[FALLO] Actividad %s fallo, se aborta su rama\n", acts[idx].id);
+                    propagar_fallo(acts, idx, pila_fallo, &restantes);
                 }
             }
 
-            for (int i = 0; i < g_num_pids_activos; i++) {
-                if (g_pids_activos[i] == hijo) {
-                    g_pids_activos[i] = g_pids_activos[--g_num_pids_activos];
-                    break;
-                }
-            }
             activos--;
 
-        } else if (!todas_terminadas(acts, n)) {
+        } else {
+            /* activos == 0 implica que tambien la cola esta vacia (si
+             * hubiera algo listo y activos < K, la fase 1 lo habria
+             * lanzado). Si aun quedan actividades por terminar, nadie
+             * puede avanzar: hay un ciclo o una dependencia irresoluble. */
             fprintf(stderr, "Error: no se puede progresar (posible ciclo en el DAG "
                              "o dependencia irresoluble)\n");
+            free(cola); free(pila_fallo);
             return -1;
         }
     }
 
+    free(cola);
+    free(pila_fallo);
     return 0;
 }
 
@@ -348,12 +494,27 @@ int ejecutar_plan(Actividad *acts, int n, int K, int prob_fallo) {
 void liberar_actividades(Actividad *acts, int n) {
     for (int i = 0; i < n; i++) {
         free(acts[i].deps);
+        free(acts[i].deps_idx);
+        free(acts[i].dependientes);
     }
     free(acts);
 }
 
 /* ---------- main ---------- */
 int main(int argc, char *argv[]) {
+    /* stdout se comparte entre el padre (que usa printf, con buffer) y los
+     * hijos (que usan write() directo, sin buffer, para [INSUMO] y
+     * [SIMULACION]). Si stdout queda con buffer completo (el default al
+     * redirigir a un archivo), el buffer del padre puede quedar sin
+     * vaciar mientras un hijo ya escribio directamente al mismo archivo:
+     * el hijo avanza el puntero del kernel, y cuando el padre por fin
+     * vacia su buffer, sus bytes (mas viejos) llegan despues, en la
+     * posicion equivocada, cortando y mezclando lineas. Forzar buffer por
+     * linea hace que cada printf(...\n) del padre se vacie al sistema de
+     * inmediato, igual que los write() de los hijos, preservando el
+     * orden real de ejecucion sin perder rendimiento perceptible. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     if (argc != 3) {
         fprintf(stderr, "Uso: %s plan.txt K\n", argv[0]);
         return 1;
@@ -376,6 +537,12 @@ int main(int argc, char *argv[]) {
     int n = 0;
     if (parsear_plan(ruta_plan, &actividades, &n) != 0 || n == 0) {
         fprintf(stderr, "Error al parsear el plan (o el plan esta vacio)\n");
+        return 1;
+    }
+
+    if (resolver_dependencias(actividades, n) != 0) {
+        fprintf(stderr, "Error al resolver dependencias del plan\n");
+        liberar_actividades(actividades, n);
         return 1;
     }
 

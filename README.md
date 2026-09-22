@@ -1,8 +1,8 @@
 # El Planificador Dieciochero
 
 Simulador y planificador de actividades modeladas como un DAG (Grafo Acíclico
-Dirigido), implementado con procesos (`fork`), tuberías (`pipe`) y señales
-(`SIGINT`) en C. Sin hilos ni mecanismos de sincronización de hilos.
+Dirigido), implementado con procesos (`fork`), tuberías (`pipes`) y señales
+(`SIGINT`) en C. Sin hilos ni mecanismos de sincronización.
 
 ## Compilación
 
@@ -10,8 +10,7 @@ Dirigido), implementado con procesos (`fork`), tuberías (`pipe`) y señales
 gcc -Wall -Wextra -std=c17 -o planificador main.c -lpthread
 ```
 
-(El flag `-lpthread` se incluye porque lo exige la pauta de compilación
-estricta del curso, aunque el programa no usa hilos.)
+(El flag `-lpthread` se incluye porque lo exige la pauta, aunque el programa no usa hilos.)
 
 ## Uso
 
