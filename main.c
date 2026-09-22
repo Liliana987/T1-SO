@@ -49,6 +49,18 @@ static pid_t g_pids_activos[MAX_ACTIVIDADES];
 static int   g_idx_activos[MAX_ACTIVIDADES];
 static int g_num_pids_activos = 0;
 
+/* Mascara con solo SIGINT: se usa para bloquear la señal durante las
+ * secciones criticas donde se modifican g_pids_activos / g_idx_activos /
+ * g_num_pids_activos (registrar un pid recien creado, o remover uno tras
+ * waitpid). Si SIGINT llegara justo en medio de esa actualizacion, el
+ * manejador podria recorrer los arreglos a medio escribir y, en el peor
+ * caso, dejar un hijo recien hecho fork sin recibir SIGTERM (quedaria
+ * corriendo como huerfano tras el _exit(130) del padre). Bloqueando la
+ * señal durante esas pocas lineas, cualquier SIGINT que llegue ahi queda
+ * pendiente y se entrega recien cuando los arreglos vuelven a un estado
+ * consistente. */
+static sigset_t g_sigint_set;
+
 /* ---------- Prototipos ---------- */
 static char *trim(char *s);
 int parsear_plan(const char *ruta, Actividad **out, int *out_n);
@@ -56,6 +68,17 @@ int resolver_dependencias(Actividad *acts, int n);
 void manejador_sigint(int sig);
 int ejecutar_plan(Actividad *acts, int n, int K, int prob_fallo);
 void liberar_actividades(Actividad *acts, int n);
+static void bloquear_sigint(sigset_t *anterior);
+static void desbloquear_sigint(const sigset_t *anterior);
+
+/* ---------- bloqueo/desbloqueo de SIGINT para secciones criticas ---------- */
+static void bloquear_sigint(sigset_t *anterior) {
+    sigprocmask(SIG_BLOCK, &g_sigint_set, anterior);
+}
+
+static void desbloquear_sigint(const sigset_t *anterior) {
+    sigprocmask(SIG_SETMASK, anterior, NULL);
+}
 
 /* ---------- utilidades ---------- */
 static char *trim(char *s) {
@@ -412,9 +435,17 @@ int ejecutar_plan(Actividad *acts, int n, int K, int prob_fallo) {
             close(acts[i].pipe_fd[1]);
             acts[i].pid = pid;
             acts[i].estado = CORRIENDO;
+
+            /* Seccion critica: SIGINT bloqueada mientras se registra el
+             * pid recien creado en los arreglos globales (ver comentario
+             * junto a g_sigint_set). */
+            sigset_t sigint_previo;
+            bloquear_sigint(&sigint_previo);
             g_pids_activos[g_num_pids_activos] = pid;
             g_idx_activos[g_num_pids_activos] = i;
             g_num_pids_activos++;
+            desbloquear_sigint(&sigint_previo);
+
             activos++;
         }
 
@@ -429,8 +460,13 @@ int ejecutar_plan(Actividad *acts, int n, int K, int prob_fallo) {
             }
 
             /* Encontrar el indice del hijo recorriendo solo los procesos
-             * activos (a lo mas K), no las n actividades. */
+             * activos (a lo mas K), no las n actividades. Seccion critica:
+             * SIGINT bloqueada mientras se busca y se remueve (swap con el
+             * ultimo) el pid de los arreglos globales, por la misma razon
+             * que al registrarlo. */
             int idx = -1, pos = -1;
+            sigset_t sigint_previo2;
+            bloquear_sigint(&sigint_previo2);
             for (int p = 0; p < g_num_pids_activos; p++) {
                 if (g_pids_activos[p] == hijo) { pos = p; idx = g_idx_activos[p]; break; }
             }
@@ -439,6 +475,7 @@ int ejecutar_plan(Actividad *acts, int n, int K, int prob_fallo) {
                 g_idx_activos[pos]  = g_idx_activos[g_num_pids_activos - 1];
                 g_num_pids_activos--;
             }
+            desbloquear_sigint(&sigint_previo2);
 
             if (idx >= 0) {
                 ssize_t leidos = read(acts[idx].pipe_fd[0], acts[idx].mensaje,
@@ -527,6 +564,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    if (K > MAX_ACTIVIDADES) {
+        fprintf(stderr, "K no puede ser mayor a %d (limite maximo soportado)\n",
+                MAX_ACTIVIDADES);
+        return 1;
+    }
+
+    /* g_sigint_set se arma una sola vez aqui y se usa despues para
+     * bloquear/desbloquear SIGINT en las secciones criticas de
+     * ejecutar_plan (ver bloquear_sigint/desbloquear_sigint). */
+    sigemptyset(&g_sigint_set);
+    sigaddset(&g_sigint_set, SIGINT);
+
     struct sigaction sa;
     sa.sa_handler = manejador_sigint;
     sigemptyset(&sa.sa_mask);
@@ -537,6 +586,13 @@ int main(int argc, char *argv[]) {
     int n = 0;
     if (parsear_plan(ruta_plan, &actividades, &n) != 0 || n == 0) {
         fprintf(stderr, "Error al parsear el plan (o el plan esta vacio)\n");
+        return 1;
+    }
+
+    if (n > MAX_ACTIVIDADES) {
+        fprintf(stderr, "El plan tiene %d actividades, se supera el maximo "
+                        "soportado (%d)\n", n, MAX_ACTIVIDADES);
+        liberar_actividades(actividades, n);
         return 1;
     }
 
