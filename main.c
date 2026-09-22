@@ -235,6 +235,9 @@ int resolver_dependencias(Actividad *acts, int n) {
             if (j >= 0) {
                 a->pendientes++;
                 out_count[j]++;
+            } else {
+                fprintf(stderr, "Advertencia: %s depende de '%s' que no existe\n",
+                        a->id, a->deps[d]);
             }
         }
     }
